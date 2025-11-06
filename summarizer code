@@ -1,0 +1,671 @@
+import os
+import httpx
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
+import json
+import datetime
+from pypdf import PdfReader
+import hashlib
+
+# Import Document class for correct metadata handling
+from langchain_core.documents import Document
+
+# For docx support
+import docx
+
+# For export functionality
+import io
+from fpdf import FPDF
+from docx import Document as DocxDocument
+
+# For sanitizing text for PDF
+import unicodedata
+
+def sanitize_for_pdf(text):
+    replacements = {
+        '’': "'",
+        '‘': "'",
+        '“': '"',
+        '”': '"',
+        '–': '-',
+        '—': '-',
+        '…': '...',
+    }
+    for orig, repl in replacements.items():
+        text = text.replace(orig, repl)
+    # Remove other non-latin-1 characters
+    return ''.join(c if ord(c) < 256 else '?' for c in text)
+
+# Set tiktoken cache directory
+TIKTOKEN_CACHE_DIR = os.path.abspath("tiktoken_cache")
+os.environ["TIKTOKEN_CACHE_DIR"] = TIKTOKEN_CACHE_DIR
+assert os.path.exists(os.path.join(TIKTOKEN_CACHE_DIR, "9b5ad71b2ce5302211f9c61530b329a4922fc6a4")), "tiktoken cache not found!"
+
+# Load environment
+load_dotenv()
+BASE_URL = os.getenv("OPENAI_BASE_URL", "<base_url>")
+API_KEY = os.getenv("OPENAI_API_KEY", "<api_key>")
+PROXY = os.getenv("HTTP_PROXY", "")
+VERIFY_STR = os.getenv("HTTP_VERIFY", "false").lower()
+VERIFY = False if VERIFY_STR in ("false", "0", "no") else True
+
+proxies = {"http://": PROXY, "https://": PROXY} if PROXY else None
+client = httpx.Client(verify=VERIFY)
+
+# --- RAG parameters ---
+CHUNK_SIZE = 500
+CHUNK_OVERLAP = 100
+TOP_K = 5
+
+# Choose the best model for summarization (reason: GPT-4o is the most advanced, general-purpose, and robust for summarization)
+SUMMARIZATION_MODEL = 'azure/genailab-maas-gpt-4o'
+
+SUMMARY_PROMPT_TMPL = (
+    "You are an expert summarizer. Produce a concise summary of the document provided. "
+    "Output 3-6 short bullet points (each on its own line) capturing the main ideas, and include a one-line overall summary.\n\nDocument:\n{document}\n\nSummary:"
+)
+
+FAISS_INDEX_DIR = "faiss_index"
+FAISS_INDEX_PATH = os.path.join(FAISS_INDEX_DIR, "index")
+METADATA_PATH = os.path.join(FAISS_INDEX_DIR, "metadata.json")
+
+# Ensure index dir exists
+os.makedirs(FAISS_INDEX_DIR, exist_ok=True)
+
+# Helper: Load metadata
+if os.path.exists(METADATA_PATH):
+    with open(METADATA_PATH, "r", encoding="utf-8") as f:
+        all_metadata = json.load(f)
+else:
+    all_metadata = []
+
+# Helper: Load or create FAISS index
+vectordb = None
+if os.path.exists(FAISS_INDEX_PATH):
+    try:
+        embeddings = OpenAIEmbeddings(
+            base_url=BASE_URL,
+            openai_api_key=API_KEY,
+            http_client=client,
+            model="azure/genailab-maas-text-embedding-3-large"
+        )
+        vectordb = FAISS.load_local(FAISS_INDEX_PATH, embeddings, allow_dangerous_deserialization=True)
+    except Exception as e:
+        st.warning(f"Could not load FAISS index: {e}. Will create a new one.")
+        vectordb = None
+
+# --- Streamlit UI ---
+st.set_page_config(page_title="Document Summarizer", page_icon="📝", layout="centered")
+st.markdown("""
+    <style>
+    .main {background-color: #f8fafc;}
+    /* Animated gradient background for login area */
+    .login-gradient-bg {
+        min-height: 100vh;
+        width: 100vw;
+        position: fixed;
+        top: 0; left: 0;
+        z-index: -1;
+        background: linear-gradient(270deg, #6a11cb, #2575fc, #43cea2, #185a9d, #f7971e, #ffd200, #6a11cb);
+        background-size: 1400% 1400%;
+        animation: gradientMove 18s ease-in-out infinite;
+    }
+    @keyframes gradientMove {
+      0% {background-position: 0% 50%;}
+      25% {background-position: 50% 100%;}
+      50% {background-position: 100% 50%;}
+      75% {background-position: 50% 0%;}
+      100% {background-position: 0% 50%;}
+    }
+    /* Input field focus animation (glow effect) */
+    .stTextInput>div>div>input:focus, .stTextInput>div>div>textarea:focus {
+        outline: none !important;
+        border: 2px solid #6a11cb !important;
+        box-shadow: 0 0 0 3px #6a11cb44, 0 0 8px 2px #2575fc55 !important;
+        transition: box-shadow 0.3s, border 0.3s;
+    }
+    /* Login card styling for contrast */
+    .login-card {
+        background: rgba(255,255,255,0.92);
+        border-radius: 18px;
+        box-shadow: 0 4px 32px #0002;
+        padding: 2.5em 2em 2em 2em;
+        max-width: 370px;
+        margin: 7vh auto 0 auto;
+        border: 1px solid #e0e0e0;
+    }
+    </style>
+    <div class='login-gradient-bg'></div>
+    """, unsafe_allow_html=True)
+
+st.title("📝 Minimal Document Summarizer (RAG)")
+st.caption("Summarize any text or document using advanced GenAI models and retrieval-augmented generation.")
+
+# --- Simple Hardcoded Users and Roles ---
+USERS = {
+    "admin": {"password": "adminpass", "role": "admin"},
+    "user": {"password": "userpass", "role": "user"},
+}
+
+def login_form():
+    st.markdown('<div class="login-card">', unsafe_allow_html=True)
+    # Add book image at the top of the login card
+    st.markdown('<div style="text-align:center;margin-bottom:1em;"><img src="https://img.icons8.com/ios-filled/100/6a11cb/book.png" alt="Book" width="64" height="64"/></div>', unsafe_allow_html=True)
+    st.markdown("## Login")
+    username = st.text_input("Username", key="login_user")
+    password = st.text_input("Password", type="password", key="login_pass")
+    login_btn = st.button("Login", key="login_btn")
+    if login_btn:
+        user = USERS.get(username)
+        if user and user["password"] == password:
+            st.session_state["logged_in"] = True
+            st.session_state["username"] = username
+            st.session_state["role"] = user["role"]
+            st.success(f"Logged in as {username} ({user['role']})")
+            st.rerun()
+        else:
+            st.error("Invalid username or password.")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+    st.session_state["username"] = None
+    st.session_state["role"] = None
+
+if not st.session_state["logged_in"]:
+    login_form()
+    st.stop()
+
+# --- Show current user/role and logout ---
+st.sidebar.markdown(f"**User:** {st.session_state['username']}  ")
+st.sidebar.markdown(f"**Role:** {st.session_state['role']}")
+if st.sidebar.button("Logout"):
+    st.session_state["logged_in"] = False
+    st.session_state["username"] = None
+    st.session_state["role"] = None
+    st.rerun()
+
+# --- Role-based UI ---
+role = st.session_state["role"]
+
+# Show uploaded document list (all roles)
+if all_metadata:
+    st.markdown("**Knowledge Base Documents:**")
+    for doc in {m['filename'] for m in all_metadata}:
+        st.markdown(f"- {doc}")
+
+# Only admin can upload
+if role == "admin":
+    with st.form("summarize_form"):
+        uploaded_files = st.file_uploader("📤 Upload one or more documents (txt, md, docx, pdf)", type=["txt", "md", "docx", "pdf"], accept_multiple_files=True)
+        submitted = st.form_submit_button("Add to Knowledge Base 🗂️")
+else:
+    uploaded_files = None
+    submitted = False
+
+# Helper: Get all document hashes in metadata
+existing_hashes = set(m.get('doc_hash') for m in all_metadata if 'doc_hash' in m)
+
+# --- Add uploaded files to persistent FAISS index ---
+if uploaded_files and submitted:
+    st.markdown("<div style='text-align:center;'><div class='lds-ring'><div></div><div></div><div></div><div></div></div><br><b>Uploading and indexing documents...</b></div>", unsafe_allow_html=True)
+    embeddings = OpenAIEmbeddings(
+        base_url=BASE_URL,
+        openai_api_key=API_KEY,
+        http_client=client,
+        model="azure/genailab-maas-text-embedding-3-large"
+    )
+    new_docs = []
+    new_metadata = []
+    duplicate_files = []
+    for uploaded_file in uploaded_files:
+        filetype = uploaded_file.name.split(".")[-1].lower()
+        # Read file content as bytes for hashing
+        file_bytes = uploaded_file.read()
+        uploaded_file.seek(0)
+        # Compute SHA256 hash of file content
+        doc_hash = hashlib.sha256(file_bytes).hexdigest()
+        if doc_hash in existing_hashes:
+            duplicate_files.append(uploaded_file.name)
+            continue
+        # Decode or parse file content
+        if filetype in ["txt", "md"]:
+            text = file_bytes.decode("utf-8")
+        elif filetype == "docx":
+            try:
+                doc = docx.Document(uploaded_file)
+                text = "\n".join([para.text for para in doc.paragraphs])
+            except Exception as e:
+                st.error(f"Failed to read docx: {e}")
+                continue
+        elif filetype == "pdf":
+            try:
+                pdf = PdfReader(uploaded_file)
+                text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+            except Exception as e:
+                st.error(f"Failed to read pdf: {e}")
+                continue
+        else:
+            st.error(f"Unsupported file type: {uploaded_file.name}")
+            continue
+        splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+        doc_chunks = splitter.create_documents([text])
+        upload_time = datetime.datetime.now().isoformat()
+        for idx, chunk in enumerate(doc_chunks):
+            chunk.metadata = {
+                "filename": uploaded_file.name,
+                "upload_time": upload_time,
+                "chunk_index": idx,
+                "doc_hash": doc_hash
+            }
+        new_docs.extend(doc_chunks)
+        new_metadata.extend([chunk.metadata for chunk in doc_chunks])
+        existing_hashes.add(doc_hash)
+    if duplicate_files:
+        st.info(f"Skipped duplicate document(s): {', '.join(duplicate_files)} (already in knowledge base)")
+    if new_docs:
+        if vectordb is None:
+            vectordb = FAISS.from_documents(new_docs, embeddings)
+        else:
+            vectordb.add_documents(new_docs)
+        all_metadata.extend(new_metadata)
+        vectordb.save_local(FAISS_INDEX_PATH)
+        with open(METADATA_PATH, "w", encoding="utf-8") as f:
+            json.dump(all_metadata, f, indent=2)
+        st.success(f"Added {len(new_docs)} chunks from {len(new_metadata)} new document(s) to the knowledge base.")
+        st.rerun()
+
+# Only admin can delete
+if role == "admin":
+    doc_filenames = sorted({m['filename'] for m in all_metadata})
+    delete_doc = None
+    if doc_filenames:
+        st.markdown("---")
+        st.subheader("Delete Document from Knowledge Base")
+        delete_doc = st.selectbox("Select a document to delete:", doc_filenames, key="delete_doc_select")
+        if st.button("🗑️ Delete Selected Document", key="delete_doc_btn"):
+            # Remove metadata entries for this file
+            new_metadata = [m for m in all_metadata if m['filename'] != delete_doc]
+            # Rebuild FAISS index from remaining chunks
+            if new_metadata:
+                embeddings = OpenAIEmbeddings(
+                    base_url=BASE_URL,
+                    openai_api_key=API_KEY,
+                    http_client=client,
+                    model="azure/genailab-maas-text-embedding-3-large"
+                )
+                # For each metadata entry, retrieve the chunk text from the current vectordb
+                new_docs = []
+                for m in new_metadata:
+                    # Find the chunk in the current vectordb by metadata
+                    found = False
+                    for d in vectordb.similarity_search(m['filename'], k=1000):
+                        if d.metadata.get('chunk_index') == m['chunk_index'] and d.metadata.get('filename') == m['filename']:
+                            # Recreate Document with original metadata
+                            new_docs.append(Document(page_content=d.page_content, metadata=m))
+                            found = True
+                            break
+                    if not found:
+                        st.warning(f"Could not find chunk for {m['filename']} chunk {m['chunk_index']}")
+                # Rebuild FAISS
+                if new_docs:
+                    vectordb_new = FAISS.from_documents(new_docs, embeddings)
+                    vectordb_new.save_local(FAISS_INDEX_PATH)
+                    vectordb = vectordb_new
+                else:
+                    # No docs left, remove index files
+                    import shutil
+                    shutil.rmtree(FAISS_INDEX_DIR)
+                    os.makedirs(FAISS_INDEX_DIR, exist_ok=True)
+            else:
+                # No docs left, remove index files
+                import shutil
+                shutil.rmtree(FAISS_INDEX_DIR)
+                os.makedirs(FAISS_INDEX_DIR, exist_ok=True)
+            # Save new metadata
+            with open(METADATA_PATH, "w", encoding="utf-8") as f:
+                json.dump(new_metadata, f, indent=2)
+            st.success(f"Deleted document: {delete_doc}")
+            st.rerun()
+
+# --- Chatbot/Assistant Tab ---
+tabs = st.tabs(["Summarize", "Chat with Assistant"])
+
+with tabs[0]:
+    # --- Summarization Form (all roles) ---
+    st.markdown("---")
+    st.subheader("Summarize Knowledge Base")
+    with st.form("summarize_kb_form"):
+        query_text = st.text_area("Enter your query or leave blank to summarize the whole knowledge base:", "summarize this document")
+        summarize_submitted = st.form_submit_button("Summarize 📝")
+
+    # --- Summary persistence and display/export ---
+    if "last_summary" not in st.session_state:
+        st.session_state["last_summary"] = None
+        st.session_state["last_chunks"] = None
+
+    if summarize_submitted and vectordb is not None:
+        st.markdown("<div style='text-align:center;'><div class='lds-ring'><div></div><div></div><div></div><div></div></div><br><b>Summarizing (RAG)...</b></div>", unsafe_allow_html=True)
+        retrieved_docs = vectordb.similarity_search(query_text, k=TOP_K)
+        if not retrieved_docs:
+            st.warning("No relevant chunks found in the knowledge base. Please upload documents or check your query.")
+            st.session_state["last_summary"] = None
+            st.session_state["last_chunks"] = None
+        else:
+            context = "\n".join([d.page_content for d in retrieved_docs])
+            llm = ChatOpenAI(
+                base_url=BASE_URL,
+                model=SUMMARIZATION_MODEL,
+                openai_api_key=API_KEY,
+                http_client=client,
+            )
+            prompt = SUMMARY_PROMPT_TMPL.format(document=context)
+            try:
+                response = llm.invoke(prompt)
+            except Exception as e:
+                summary = f"Error calling model: {e}"
+            else:
+                summary = response.content if hasattr(response, "content") else str(response)
+            st.session_state["last_summary"] = summary
+            st.session_state["last_chunks"] = [d.metadata for d in retrieved_docs]
+
+    # --- Show summary and export if available ---
+    if st.session_state["last_summary"]:
+        st.markdown("---")
+        st.subheader("Summary")
+        st.markdown(f"<div style='background:#fff;border-radius:8px;padding:1.2em 1.5em;border:1px solid #e0e0e0;'>"
+                    f"<pre style='font-size:1.08rem;line-height:1.5;background:inherit;border:none;margin:0;'>{st.session_state['last_summary']}</pre></div>", unsafe_allow_html=True)
+        st.markdown("---")
+        st.caption("Powered by GenAI Lab, LangChain, FAISS & Streamlit")
+        # Show retrieved chunk metadata if available
+        if st.session_state["last_chunks"]:
+            st.markdown("**Retrieved Chunks:**")
+            for meta in st.session_state["last_chunks"]:
+                st.markdown(f"- **{meta.get('filename','?')}** (chunk {meta.get('chunk_index','?')})")
+        # --- Export Summary Section ---
+        st.subheader("Export Summary")
+        default_filename = f"summary_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        col1, col2, col3 = st.columns(3)
+        # TXT
+        txt_bytes = st.session_state["last_summary"].encode("utf-8")
+        with col1:
+            st.download_button(
+                label="📄 Download TXT",
+                data=txt_bytes,
+                file_name=f"{default_filename}.txt",
+                mime="text/plain"
+            )
+        # DOCX
+        docx_buffer = io.BytesIO()
+        docx_doc = DocxDocument()
+        docx_doc.add_heading("Summary", 0)
+        for line in st.session_state["last_summary"].splitlines():
+            docx_doc.add_paragraph(line)
+        docx_doc.save(docx_buffer)
+        docx_buffer.seek(0)
+        with col2:
+            st.download_button(
+                label="📝 Download DOCX",
+                data=docx_buffer,
+                file_name=f"{default_filename}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+        # PDF
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        for line in st.session_state["last_summary"].splitlines():
+            safe_line = sanitize_for_pdf(line)
+            pdf.multi_cell(0, 10, safe_line)
+        pdf_bytes = pdf.output(dest='S').encode('latin-1')
+        pdf_buffer = io.BytesIO(pdf_bytes)
+        with col3:
+            st.download_button(
+                label="📑 Download PDF",
+                data=pdf_buffer,
+                file_name=f"{default_filename}.pdf",
+                mime="application/pdf"
+            )
+    else:
+        st.markdown("<div style='height:2em'></div>", unsafe_allow_html=True)
+
+# --- Chatbot/Assistant Popup ---
+CHAT_POPUP_CSS = '''
+<style>
+#chat-popup {
+  position: fixed;
+  bottom: 32px;
+  right: 32px;
+  z-index: 9999;
+  width: 370px;
+  max-width: 95vw;
+  background: #fff;
+  border-radius: 18px;
+  box-shadow: 0 4px 32px #0002;
+  border: 1px solid #e0e0e0;
+  padding: 0.5em 0.8em 0.8em 0.8em;
+  transition: box-shadow 0.2s;
+}
+#chat-popup-header {
+  display: flex;
+  align-items: center;
+  gap: 0.7em;
+  font-size: 1.15em;
+  font-weight: 600;
+  padding: 0.5em 0;
+  border-bottom: 1px solid #eee;
+}
+#chat-popup-close {
+  margin-left: auto;
+  cursor: pointer;
+  font-size: 1.2em;
+  color: #888;
+  border: none;
+  background: none;
+}
+#chat-popup-close:hover {
+  color: #2575fc;
+}
+</style>
+'''
+st.markdown(CHAT_POPUP_CSS, unsafe_allow_html=True)
+
+if "show_chat_popup" not in st.session_state:
+    st.session_state["show_chat_popup"] = False
+
+# Floating chat button (Streamlit-native)
+chat_fab_css = '''
+<style>
+.stChatFab { position: fixed; bottom: 32px; right: 32px; z-index: 9998; }
+.stChatFab button {
+  background: linear-gradient(90deg, #6a11cb 0%, #2575fc 100%);
+  color: #fff;
+  border-radius: 50%;
+  width: 56px;
+  height: 56px;
+  font-size: 2em;
+  box-shadow: 0 2px 8px #0002;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.stChatFab button:hover {
+  background: linear-gradient(90deg, #2575fc 0%, #6a11cb 100%);
+}
+</style>
+'''
+st.markdown(chat_fab_css, unsafe_allow_html=True)
+
+chat_fab_container = st.container()
+with chat_fab_container:
+    st.markdown('<div class="stChatFab">', unsafe_allow_html=True)
+    if st.button("💬", key="chat_fab_btn"):
+        st.session_state["show_chat_popup"] = True
+    st.markdown('</div>', unsafe_allow_html=True)
+
+if st.session_state["show_chat_popup"]:
+    st.markdown('''<div id="chat-popup">''', unsafe_allow_html=True)
+    st.markdown('''<div id="chat-popup-header">🤖 Chat Assistant <button id="chat-popup-close" style="margin-left:auto;font-size:1.2em;color:#888;border:none;background:none;cursor:pointer;" onClick="window.location.reload()">✖</button></div>''', unsafe_allow_html=True)
+    # --- Chat UI ---
+    st.header("💬 Chat with Virtual Assistant")
+    # Initialize chat history in session state
+    if "chat_history" not in st.session_state:
+        st.session_state["chat_history"] = []  # Each item: {role: 'user'|'assistant'|'admin', 'content': str}
+    # Avatar and color config
+    AVATARS = {
+        "user": "👤",
+        "assistant": "🤖",
+        "admin": "🛡️"
+    }
+    BUBBLE_COLORS = {
+        "user": "#e0f7fa",
+        "assistant": "#f3e8ff",
+        "admin": "#ffe0b2"
+    }
+    # Display chat history as bubbles
+    for msg in st.session_state["chat_history"]:
+        align = "flex-start" if msg["role"] in ("user", "admin") else "flex-end"
+        bubble_color = BUBBLE_COLORS.get(msg["role"], "#f0f0f0")
+        avatar = AVATARS.get(msg["role"], "❓")
+        st.markdown(f"""
+        <div style='display:flex;justify-content:{'flex-start' if msg['role'] in ('user','admin') else 'flex-end'};margin-bottom:0.5em;'>
+            <div style='background:{bubble_color};border-radius:1.2em;padding:0.7em 1.2em;max-width:70%;box-shadow:0 1px 4px #0001;'>
+                <span style='font-size:1.3em;margin-right:0.5em;'>{avatar}</span>
+                <span style='font-size:1.08em;'>{msg['content']}</span>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+    # Chat input
+    chat_col1, chat_col2 = st.columns([5,1])
+    # If just sent a message, clear input before rendering widget
+    if "clear_chat_input" in st.session_state and st.session_state["clear_chat_input"]:
+        st.session_state["chat_input"] = ""
+        st.session_state["clear_chat_input"] = False
+    with chat_col1:
+        user_input = st.text_input("Type your question...", key="chat_input", value=st.session_state.get("chat_input", ""))
+    with chat_col2:
+        send_clicked = st.button("➡️ Send", key="chat_send_btn")
+    # On send, process user message
+    if send_clicked and user_input.strip():
+        # Add user message to history
+        user_role = st.session_state["role"] if st.session_state["role"] in ("user", "admin") else "user"
+        st.session_state["chat_history"].append({"role": user_role, "content": user_input.strip()})
+        # RAG retrieval
+        retrieved_docs = vectordb.similarity_search(user_input, k=TOP_K) if vectordb is not None else []
+        context = "\n".join([d.page_content for d in retrieved_docs]) if retrieved_docs else ""
+        # Context relevance check
+        context_relevant = bool(retrieved_docs) and len(context.strip()) > 30  # threshold: at least one chunk and >30 chars
+        # Build prompt: include last N turns (e.g., 3) for context
+        N = 3
+        chat_context = "\n".join([f"{m['role']}: {m['content']}" for m in st.session_state["chat_history"][-N*2:]])
+        # Refined system prompt with personality and guardrails
+        SYSTEM_PROMPT = (
+            "You are Sage, a witty, friendly, and knowledgeable virtual assistant. "
+            "You answer questions strictly based on the provided knowledge base documents. "
+            "If a question is out of scope or not supported by the knowledge base, politely refuse and explain your limitations. "
+            "Always cite your sources (filename, chunk #) when possible. "
+            "Never answer prohibited or sensitive topics. Add a touch of humor and encouragement in your responses."
+        )
+        sources = []
+        if not context_relevant:
+            assistant_reply = (
+                "Sorry, I can only answer questions based on the uploaded documents in your knowledge base. "
+                "Try asking something related to your documents! 😊"
+            )
+        else:
+            prompt = (
+                f"{SYSTEM_PROMPT}\n\n"
+                f"Knowledge Base Context:\n{context}\n\n"
+                f"Conversation so far:\n{chat_context}\n\n"
+                f"User: {user_input}\nAssistant:"
+            )
+            llm = ChatOpenAI(
+                base_url=BASE_URL,
+                model=SUMMARIZATION_MODEL,
+                openai_api_key=API_KEY,
+                http_client=client,
+            )
+            st.markdown("<div style='text-align:center;'><div class='lds-ring'><div></div><div></div><div></div><div></div></div><br><b>Assistant is typing...</b></div>", unsafe_allow_html=True)
+            try:
+                response = llm.invoke(prompt)
+                assistant_reply = response.content if hasattr(response, "content") else str(response)
+                # Store sources only if context is relevant
+                if context_relevant and retrieved_docs:
+                    sources = [f"{d.metadata.get('filename','?')} (chunk {d.metadata.get('chunk_index','?')})" for d in retrieved_docs]
+            except Exception as e:
+                assistant_reply = f"[Error: {e}]"
+        st.session_state["chat_history"].append({"role": "assistant", "content": assistant_reply, "sources": sources})
+        # Set flag to clear input on next rerun
+        st.session_state["clear_chat_input"] = True
+        st.rerun()
+    # Option to clear chat
+    if st.button("Clear Chat", key="clear_chat_btn"):
+        st.session_state["chat_history"] = []
+        st.rerun()
+
+    # --- Export Chat Transcript Section ---
+    if st.session_state["chat_history"]:
+        st.markdown("---")
+        st.subheader("Export Chat Transcript")
+        default_chat_filename = f"chat_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        transcript_lines = []
+        for msg in st.session_state["chat_history"]:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            transcript_lines.append(f"{role.title()}: {content}")
+            if role == "assistant" and msg.get("sources"):
+                transcript_lines.append(f"  Sources: {', '.join(msg['sources'])}")
+        transcript_text = "\n\n".join(transcript_lines)
+        # TXT
+        txt_bytes = transcript_text.encode("utf-8")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.download_button(
+                label="Download TXT",
+                data=txt_bytes,
+                file_name=f"{default_chat_filename}.txt",
+                mime="text/plain"
+            )
+        # DOCX
+        docx_buffer = io.BytesIO()
+        docx_doc = DocxDocument()
+        docx_doc.add_heading("Chat Transcript", 0)
+        for line in transcript_lines:
+            docx_doc.add_paragraph(line)
+        docx_doc.save(docx_buffer)
+        docx_buffer.seek(0)
+        with col2:
+            st.download_button(
+                label="Download DOCX",
+                data=docx_buffer,
+                file_name=f"{default_chat_filename}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
+        # PDF
+        pdf = FPDF()
+        pdf.add_page()
+        pdf.set_font("Arial", size=12)
+        for line in transcript_lines:
+            # Replace unsupported unicode characters for PDF
+            safe_line = sanitize_for_pdf(line)
+            pdf.multi_cell(0, 10, safe_line)
+        pdf_bytes = pdf.output(dest='S').encode('latin-1')
+        pdf_buffer = io.BytesIO(pdf_bytes)
+        with col3:
+            st.download_button(
+                label="Download PDF",
+                data=pdf_buffer,
+                file_name=f"{default_chat_filename}.pdf",
+                mime="application/pdf"
+            )
+    st.markdown('''</div>''', unsafe_allow_html=True)
+    # Add a Streamlit button to close the popup
+    if st.button("Close Chat", key="close_chat_popup_btn"):
+        st.session_state["show_chat_popup"] = False
+        st.rerun()
